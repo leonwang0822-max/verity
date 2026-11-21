@@ -3,6 +3,12 @@
 
 const config = require('../config');
 const db = require('../database/db');
+const {
+    openaiTools,
+    anthropicTools,
+    executeTool,
+    buildTemporalAwarenessBlock,
+} = require('./aiTools');
 
 const DEFAULT_SYSTEM_PROMPT = `You are Verity, a hilarious, witty, and super funny AI assistant embedded in Lume's Realm Discord server.
 Introduction / Persona:
@@ -14,6 +20,11 @@ Key Server Knowledge (IMPORTANT RULE: ONLY MENTION IF SPECIFICALLY ASKED):
 Emoji Reaction Feature (RARE / OCCASIONAL ONLY):
 - DO NOT react to every message! Only react occasionally (around 15-20% of the time) when a user's message is exceptionally funny, wild, awesome, or truly noteworthy.
 - If you decide to react, put [REACT: emoji1, emoji2] at the very end of your reply text. Example: [REACT: 😂, 💀]. Most of the time, do NOT include the tag.
+Live awareness & tools:
+- You operate in the real world in 2026+. Do NOT claim a hard knowledge cutoff in 2023/2024.
+- Prefer tools for current events, news, prices, scores, "what's happening now", recent releases, and time/date questions (web_search, fetch_url, get_current_time).
+- Leon's relevant local timezone is Asia/Shanghai when timezone matters.
+- Never name upstream AI vendors/models in user-facing replies — you are Verity.
 Rules & Constraints:
 - Pretend to be Verity, an all-knowing, hilarious, witty entity. Do not start every message with a repetitive greeting. Just answer naturally.
 - Be funny, witty, and helpful.
@@ -154,6 +165,52 @@ function anthropicText(data) {
     return blocks.filter(block => block && block.type === 'thinking').map(block => block.thinking || '').join('').trim();
 }
 
+function openaiMessageText(message) {
+    const content = message?.content;
+    if (typeof content === 'string') return content.trim();
+    if (Array.isArray(content)) {
+        return content
+            .filter((part) => part && (part.type === 'text' || typeof part.text === 'string'))
+            .map((part) => part.text || '')
+            .join('')
+            .trim();
+    }
+    return '';
+}
+
+async function postChatOnce(apiKey, endpointBase, anthropic, candidateModel, body, timeoutMs) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+        const response = await fetch(anthropic ? `${endpointBase}/messages` : `${endpointBase}/chat/completions`, {
+            method: 'POST',
+            headers: anthropic
+                ? {
+                    'Content-Type': 'application/json',
+                    'x-api-key': apiKey,
+                    'anthropic-version': '2023-06-01',
+                }
+                : {
+                    'Content-Type': 'application/json',
+                    'Authorization': `Bearer ${apiKey}`,
+                },
+            body: JSON.stringify(body),
+            signal: controller.signal,
+        });
+
+        if (!response.ok) {
+            const errBody = await response.text().catch(() => '');
+            throw new Error(`API error ${response.status} (${candidateModel}): ${errBody.slice(0, 300)}`);
+        }
+        return await response.json();
+    } finally {
+        clearTimeout(timeout);
+    }
+}
+
+/**
+ * Single-shot chat completion (no tools). Used by moderation / ticket / summary paths.
+ */
 async function completeChat(apiKey, baseUrl, model, messages, options = {}) {
     const temperature = options.temperature ?? 0.7;
     const maxTokens = options.maxTokens ?? 1500;
@@ -164,23 +221,14 @@ async function completeChat(apiKey, baseUrl, model, messages, options = {}) {
 
     let lastErr = null;
     for (const candidateModel of candidateModels) {
-        const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), timeoutMs);
         try {
             const converted = anthropic ? toAnthropicMessages(messages) : null;
-            const response = await fetch(anthropic ? `${endpointBase}/messages` : `${endpointBase}/chat/completions`, {
-                method: 'POST',
-                headers: anthropic
-                    ? {
-                        'Content-Type': 'application/json',
-                        'x-api-key': apiKey,
-                        'anthropic-version': '2023-06-01',
-                    }
-                    : {
-                        'Content-Type': 'application/json',
-                        'Authorization': `Bearer ${apiKey}`,
-                    },
-                body: JSON.stringify(anthropic
+            const data = await postChatOnce(
+                apiKey,
+                endpointBase,
+                anthropic,
+                candidateModel,
+                anthropic
                     ? {
                         model: candidateModel,
                         max_tokens: maxTokens,
@@ -193,26 +241,181 @@ async function completeChat(apiKey, baseUrl, model, messages, options = {}) {
                         messages,
                         temperature,
                         max_tokens: maxTokens,
-                    }),
-                signal: controller.signal,
-            });
+                    },
+                timeoutMs
+            );
 
-            if (!response.ok) {
-                const errBody = await response.text().catch(() => '');
-                throw new Error(`API error ${response.status} (${candidateModel}): ${errBody.slice(0, 300)}`);
-            }
-
-            const data = await response.json();
             const text = anthropic
                 ? anthropicText(data)
-                : data?.choices?.[0]?.message?.content?.trim();
+                : openaiMessageText(data?.choices?.[0]?.message);
             if (!text) throw new Error(`API returned empty content for ${candidateModel}`);
             return text;
         } catch (err) {
             lastErr = err;
             console.warn(`[AI] Model ${candidateModel} attempt failed: ${err.message}`);
-        } finally {
-            clearTimeout(timeout);
+        }
+    }
+    throw lastErr || new Error('All AI models failed');
+}
+
+async function runToolCalls(toolCalls) {
+    const results = [];
+    for (const call of toolCalls.slice(0, 4)) {
+        const name = call.name;
+        let input = call.input;
+        if (typeof input === 'string') {
+            try { input = JSON.parse(input); } catch { input = {}; }
+        }
+        if (!input || typeof input !== 'object') input = {};
+        console.log(`[AI TOOL] ${name}(${JSON.stringify(input).slice(0, 180)})`);
+        let output;
+        try {
+            output = await executeTool(name, input);
+        } catch (err) {
+            output = JSON.stringify({ ok: false, error: err.message || String(err) });
+        }
+        results.push({
+            id: call.id,
+            name,
+            output: String(output || '').slice(0, 12000),
+        });
+    }
+    return results;
+}
+
+/**
+ * Chat completion with optional tool-calling loop (OpenAI tools + Anthropic tool_use).
+ * Returns final assistant text for Discord.
+ */
+async function completeChatWithTools(apiKey, baseUrl, model, messages, options = {}) {
+    const temperature = options.temperature ?? 0.7;
+    const maxTokens = options.maxTokens ?? 1500;
+    const timeoutMs = options.timeoutMs ?? 45000;
+    const maxToolRounds = options.maxToolRounds ?? 4;
+    const enableTools = options.enableTools !== false;
+    const endpointBase = normalizeBaseUrl(baseUrl);
+    const anthropic = usesAnthropicApi(baseUrl);
+    const candidateModels = resolveCandidateModels(model);
+
+    if (!enableTools) {
+        return completeChat(apiKey, baseUrl, model, messages, options);
+    }
+
+    let lastErr = null;
+    for (const candidateModel of candidateModels) {
+        try {
+            if (anthropic) {
+                const converted = toAnthropicMessages(messages);
+                let anthMessages = converted.messages.map((m) => ({ ...m }));
+                const tools = anthropicTools();
+
+                for (let round = 0; round <= maxToolRounds; round++) {
+                    const data = await postChatOnce(
+                        apiKey,
+                        endpointBase,
+                        true,
+                        candidateModel,
+                        {
+                            model: candidateModel,
+                            max_tokens: maxTokens,
+                            temperature,
+                            tools,
+                            messages: anthMessages,
+                            ...(converted.system ? { system: converted.system } : {}),
+                        },
+                        timeoutMs
+                    );
+
+                    const blocks = Array.isArray(data?.content) ? data.content : [];
+                    const toolUses = blocks.filter((b) => b && b.type === 'tool_use');
+                    if (!toolUses.length || round === maxToolRounds) {
+                        const text = anthropicText(data);
+                        if (!text && toolUses.length) {
+                            throw new Error(`API ended on tool_use without text for ${candidateModel}`);
+                        }
+                        if (!text) throw new Error(`API returned empty content for ${candidateModel}`);
+                        return text;
+                    }
+
+                    anthMessages.push({ role: 'assistant', content: blocks });
+                    const toolResults = await runToolCalls(
+                        toolUses.map((b) => ({ id: b.id, name: b.name, input: b.input || {} }))
+                    );
+                    anthMessages.push({
+                        role: 'user',
+                        content: toolResults.map((r) => ({
+                            type: 'tool_result',
+                            tool_use_id: r.id,
+                            content: r.output,
+                        })),
+                    });
+                }
+            } else {
+                let openaiMessages = messages.map((m) => ({ ...m }));
+                const tools = openaiTools();
+
+                for (let round = 0; round <= maxToolRounds; round++) {
+                    const data = await postChatOnce(
+                        apiKey,
+                        endpointBase,
+                        false,
+                        candidateModel,
+                        {
+                            model: candidateModel,
+                            messages: openaiMessages,
+                            temperature,
+                            max_tokens: maxTokens,
+                            tools,
+                            tool_choice: 'auto',
+                        },
+                        timeoutMs
+                    );
+
+                    const msg = data?.choices?.[0]?.message;
+                    const toolCalls = Array.isArray(msg?.tool_calls) ? msg.tool_calls : [];
+                    if (!toolCalls.length || round === maxToolRounds) {
+                        const text = openaiMessageText(msg);
+                        if (!text) throw new Error(`API returned empty content for ${candidateModel}`);
+                        return text;
+                    }
+
+                    openaiMessages.push({
+                        role: 'assistant',
+                        content: msg.content || null,
+                        tool_calls: toolCalls,
+                    });
+
+                    const parsedCalls = toolCalls.map((tc) => ({
+                        id: tc.id,
+                        name: tc.function?.name || tc.name,
+                        input: tc.function?.arguments || tc.arguments || '{}',
+                    }));
+                    const toolResults = await runToolCalls(parsedCalls);
+                    for (const r of toolResults) {
+                        openaiMessages.push({
+                            role: 'tool',
+                            tool_call_id: r.id,
+                            content: r.output,
+                        });
+                    }
+                }
+            }
+        } catch (err) {
+            lastErr = err;
+            console.warn(`[AI] Tool-chat model ${candidateModel} failed: ${err.message}`);
+            // If tool schema is rejected by the proxy, fall back to plain completion once.
+            if (/tool/i.test(err.message) || /\b400\b/.test(err.message)) {
+                try {
+                    console.warn('[AI] Falling back to completion without tools for this model');
+                    return await completeChat(apiKey, baseUrl, candidateModel, messages, {
+                        temperature,
+                        maxTokens,
+                        timeoutMs,
+                    });
+                } catch (fallbackErr) {
+                    lastErr = fallbackErr;
+                }
+            }
         }
     }
     throw lastErr || new Error('All AI models failed');
@@ -550,7 +753,9 @@ async function handleAIMessage(client, message) {
     console.log(`[AI] Triggered by ${message.author.tag}: "${userQuery || '(reply)'}"`);
 
     // Prepare message history for AI context (recent channel messages + persistent AI conversation memory)
-    const currentPrompt = (settings.aiSystemPrompt || DEFAULT_SYSTEM_PROMPT) + '\n' + MODERATION_RULES;
+    const currentPrompt = (settings.aiSystemPrompt || DEFAULT_SYSTEM_PROMPT)
+        + '\n\n' + buildTemporalAwarenessBlock()
+        + '\n' + MODERATION_RULES;
     const messagesPayload = [{ role: 'system', content: currentPrompt }];
 
     // Fetch recent channel messages so Verity knows recent chat context and every participant's User ID & nickname
@@ -647,10 +852,12 @@ async function handleAIMessage(client, message) {
     let aiResponseText = null;
     let lastError = null;
     try {
-        console.log(`[AI] Requesting model ${model}...`);
-        aiResponseText = await completeChat(provider.apiKey, provider.baseUrl, model, messagesPayload, {
+        console.log(`[AI] Requesting model ${model} (tools enabled)...`);
+        aiResponseText = await completeChatWithTools(provider.apiKey, provider.baseUrl, model, messagesPayload, {
             temperature: 0.7,
             maxTokens: 1500,
+            enableTools: true,
+            maxToolRounds: 4,
         });
         console.log(`[AI] Model ${model} success! Length: ${aiResponseText.length}`);
     } catch (err) {
@@ -905,4 +1112,7 @@ module.exports = {
     isAIIgnored,
     moderateMessage,
     stripPings,
+    completeChat,
+    completeChatWithTools,
+    DEFAULT_SYSTEM_PROMPT,
 };

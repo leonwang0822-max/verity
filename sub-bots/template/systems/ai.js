@@ -1,37 +1,36 @@
-// Sub-Bot AI Chat System (Pure Conversational AI)
+// Sub-Bot AI Chat System (conversational + live tools)
 const config = require('../config');
+const path = require('path');
+
+// Reuse main Verity AI stack (prompts/tools) so sub-bot stays in sync.
+const mainAi = require(path.join(__dirname, '../../../src/systems/ai'));
+const { buildTemporalAwarenessBlock } = require(path.join(__dirname, '../../../src/systems/aiTools'));
 
 async function handleAIChat(userPrompt, conversationHistory = []) {
     if (!config.ai.enabled || !userPrompt) return null;
 
     try {
+        const systemPrompt = `${config.ai.systemPrompt}\n\n${buildTemporalAwarenessBlock()}`;
         const messages = [
-            { role: 'system', content: config.ai.systemPrompt },
+            { role: 'system', content: systemPrompt },
             ...conversationHistory.slice(-10),
             { role: 'user', content: userPrompt }
         ];
 
-        const response = await fetch(`${config.ai.baseUrl}/chat/completions`, {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'Authorization': `Bearer ${config.ai.apiKey}`
-            },
-            body: JSON.stringify({
-                model: process.env.AI_MODEL || 'claude-opus-5-5',
-                messages,
+        const reply = await mainAi.completeChatWithTools(
+            config.ai.apiKey,
+            config.ai.baseUrl,
+            process.env.AI_MODEL || 'claude-opus-5-5',
+            messages,
+            {
                 temperature: 0.7,
-                max_tokens: 300,
-            })
-        });
-
-        if (response.ok) {
-            const data = await response.json();
-            const reply = data?.choices?.[0]?.message?.content?.trim();
-            if (reply) return reply;
-        } else {
-            console.error('[SUB-BOT AI ERROR] Status:', response.status);
-        }
+                maxTokens: 500,
+                timeoutMs: 45000,
+                enableTools: true,
+                maxToolRounds: 3,
+            }
+        );
+        return reply || null;
     } catch (e) {
         console.error('[SUB-BOT AI EXCEPTION]:', e.message);
     }
